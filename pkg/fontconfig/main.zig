@@ -5,6 +5,7 @@ const config = @import("config.zig");
 const errorpkg = @import("error.zig");
 const font_set = @import("font_set.zig");
 const lang_set = @import("lang_set.zig");
+const str_set = @import("str_set.zig");
 const matrix = @import("matrix.zig");
 const object_set = @import("object_set.zig");
 const pattern = @import("pattern.zig");
@@ -28,6 +29,8 @@ pub const Config = config.Config;
 pub const Error = errorpkg.Error;
 pub const FontSet = font_set.FontSet;
 pub const LangSet = lang_set.LangSet;
+pub const StrSet = str_set.StrSet;
+pub const StrList = str_set.StrList;
 pub const Matrix = matrix.Matrix;
 pub const ObjectSet = object_set.ObjectSet;
 pub const Pattern = pattern.Pattern;
@@ -35,6 +38,19 @@ pub const Range = range.Range;
 pub const Type = value.Type;
 pub const Value = value.Value;
 pub const ValueBinding = value.ValueBinding;
+
+/// Returns the set of languages fontconfig knows about (e.g. "bn", "en").
+/// The returned set is owned by the caller and must be destroyed.
+pub fn getLangs() ?*StrSet {
+    return @ptrCast(c.FcGetLangs());
+}
+
+/// Returns the charset of glyphs supported by the given language, or null if
+/// the language is unknown. The returned charset is borrowed and must not be
+/// destroyed.
+pub fn langGetCharSet(lang: [:0]const u8) ?*const CharSet {
+    return @ptrCast(c.FcLangGetCharSet(lang.ptr));
+}
 
 test {
     @import("std").testing.refAllDecls(@This());

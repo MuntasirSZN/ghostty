@@ -266,11 +266,50 @@ pub const Fontconfig = struct {
         alloc: Allocator,
         desc: Descriptor,
     ) !DiscoverIterator {
+        return try self.discoverWithLang(alloc, desc, null);
+    }
+
+    pub fn discoverFallback(
+        self: *const Fontconfig,
+        alloc: Allocator,
+        collection: *Collection,
+        desc: Descriptor,
+    ) !DiscoverIterator {
+        _ = collection;
+
+        // When we're looking for a font that can render a specific codepoint,
+        // restrict the search to the languages whose orthography includes that
+        // codepoint. This lets fontconfig honor per-language font preferences
+        // (e.g. a user's local.conf that prefers Noto Sans Bengali for "bn")
+        // instead of falling back to whatever generic face happens to cover
+        // the codepoint.
+        var lang_set: ?*fontconfig.LangSet = null;
+        if (desc.codepoint > 0) {
+            lang_set = try langsCoveringCodepoint(desc.codepoint);
+        }
+
+        return try self.discoverWithLang(alloc, desc, lang_set);
+    }
+
+    fn discoverWithLang(
+        self: *const Fontconfig,
+        alloc: Allocator,
+        desc: Descriptor,
+        lang_set: ?*fontconfig.LangSet,
+    ) !DiscoverIterator {
         _ = alloc;
 
         // Build our pattern that we'll search for
         const pat = desc.toFcPattern();
         errdefer pat.destroy();
+
+        // Apply the language restriction before fontconfig substitutes the
+        // pattern so that per-language matching rules (e.g. in local.conf)
+        // can see it.
+        if (lang_set) |ls| {
+            assert(pat.add(.lang, .{ .lang_set = ls }, false));
+        }
+
         assert(self.fc_config.substituteWithPat(pat, .pattern));
         pat.defaultSubstitute();
 
@@ -284,19 +323,43 @@ pub const Fontconfig = struct {
             .pattern = pat,
             .set = res.fs,
             .fonts = res.fs.fonts(),
+            .lang_set = lang_set,
             .variations = desc.variations,
             .i = 0,
         };
     }
 
-    pub fn discoverFallback(
-        self: *const Fontconfig,
-        alloc: Allocator,
-        collection: *Collection,
-        desc: Descriptor,
-    ) !DiscoverIterator {
-        _ = collection;
-        return try self.discover(alloc, desc);
+    /// Returns the set of languages whose fontconfig charset covers the given
+    /// codepoint, or null if no known language covers it. The returned lang
+    /// set is owned by the caller and must be destroyed.
+    fn langsCoveringCodepoint(cp: u32) !?*fontconfig.LangSet {
+        const str_set = fontconfig.getLangs() orelse return null;
+        defer str_set.destroy();
+
+        const lang_set = fontconfig.LangSet.create();
+
+        var str_list = fontconfig.StrList.create(str_set) orelse {
+            lang_set.destroy();
+            return null;
+        };
+        defer str_list.destroy();
+
+        var found = false;
+        while (true) {
+            const lang = str_list.next() orelse break;
+            const charset = fontconfig.langGetCharSet(lang) orelse continue;
+            if (charset.hasChar(cp)) {
+                assert(lang_set.addLang(lang));
+                found = true;
+            }
+        }
+
+        if (!found) {
+            lang_set.destroy();
+            return null;
+        }
+
+        return lang_set;
     }
 
     pub const DiscoverIterator = struct {
@@ -304,12 +367,16 @@ pub const Fontconfig = struct {
         pattern: *fontconfig.Pattern,
         set: *fontconfig.FontSet,
         fonts: []*fontconfig.Pattern,
+        /// The lang set used to build the pattern. Owned by this iterator and
+        /// destroyed when it is deinitialized.
+        lang_set: ?*fontconfig.LangSet,
         variations: []const Variation,
         i: usize,
 
         pub fn deinit(self: *DiscoverIterator) void {
             self.set.destroy();
             self.pattern.destroy();
+            if (self.lang_set) |ls| ls.destroy();
             self.* = undefined;
         }
 
@@ -1265,6 +1332,34 @@ test "fontconfig codepoint" {
 
     // Should have other codepoints too
     try testing.expect(face.hasCodepoint('B', null));
+}
+
+test "fontconfig langs covering codepoint" {
+    if (options.backend != .fontconfig_freetype) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var lib = try Library.init(alloc);
+    defer lib.deinit();
+
+    var fc = Fontconfig.init(lib);
+    defer fc.deinit();
+
+    // U+09AC (Bengali letter RA) is covered by the "bn" language.
+    const langs = try Fontconfig.langsCoveringCodepoint(0x9AC);
+    defer if (langs) |l| l.destroy();
+
+    try testing.expect(langs != null);
+    try testing.expect(langs.?.hasLang("bn"));
+
+    // U+0041 (Latin A) is not Bengali, so "bn" should not cover it.
+    const latin_langs = try Fontconfig.langsCoveringCodepoint(0x0041);
+    defer if (latin_langs) |l| l.destroy();
+
+    if (latin_langs) |ll| {
+        try testing.expect(!ll.hasLang("bn"));
+    }
 }
 
 test "coretext" {
