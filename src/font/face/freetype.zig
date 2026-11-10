@@ -19,6 +19,7 @@ const opentype = @import("../opentype.zig");
 const quirks = @import("../../quirks.zig");
 const config = @import("../../config.zig");
 const global = @import("../../global.zig");
+const feature = @import("../shaper/feature.zig");
 
 const F26Dot6 = opentype.sfnt.F26Dot6;
 
@@ -49,6 +50,10 @@ pub const Face = struct {
 
     /// Freetype load flags for this font face.
     load_flags: font.face.FreetypeLoadFlags,
+
+    /// Font features configured for this face (e.g. via fontconfig). These
+    /// are applied during shaping before the global font features.
+    font_features: []harfbuzz.Feature = &.{},
 
     /// Set quirks.disableDefaultFontFeatures
     quirks_disable_default_font_features: bool = false,
@@ -104,12 +109,16 @@ pub const Face = struct {
         errdefer lib.alloc.destroy(ft_mutex);
         ft_mutex.* = .init;
 
+        const font_features = try parseFontFeatures(lib.alloc, opts.font_features);
+        errdefer if (font_features.len > 0) lib.alloc.free(font_features);
+
         var result: Face = .{
             .lib = lib,
             .face = face,
             .hb_font = hb_font,
             .ft_mutex = ft_mutex,
             .load_flags = opts.freetype_load_flags,
+            .font_features = font_features,
             .size = opts.size,
         };
         result.quirks_disable_default_font_features = quirks.disableDefaultFontFeatures(&result);
@@ -141,6 +150,7 @@ pub const Face = struct {
     }
 
     pub fn deinit(self: *Face) void {
+        if (self.font_features.len > 0) self.lib.alloc.free(self.font_features);
         self.lib.alloc.destroy(self.ft_mutex);
         {
             self.lib.mutex.lockUncancelable(global.io());
@@ -150,6 +160,36 @@ pub const Face = struct {
         }
         self.hb_font.destroy();
         self.* = undefined;
+    }
+
+    /// Parse font feature strings into the HarfBuzz representation used
+    /// for shaping. The returned slice is owned by the caller and may be
+    /// empty (in which case it must not be freed).
+    fn parseFontFeatures(
+        alloc: Allocator,
+        strings: []const []const u8,
+    ) Allocator.Error![]harfbuzz.Feature {
+        if (strings.len == 0) return &.{};
+
+        var list: feature.FeatureList = .{};
+        defer list.deinit(alloc);
+        for (strings) |str| try list.appendFromString(alloc, str);
+
+        const count = list.features.items.len;
+        if (count == 0) return &.{};
+
+        const result = try alloc.alloc(harfbuzz.Feature, count);
+        errdefer alloc.free(result);
+        for (list.features.items, 0..) |f, i| {
+            result[i] = .{
+                .tag = std.mem.nativeToBig(u32, @bitCast(f.tag)),
+                .value = f.value,
+                .start = harfbuzz.c.HB_FEATURE_GLOBAL_START,
+                .end = harfbuzz.c.HB_FEATURE_GLOBAL_END,
+            };
+        }
+
+        return result;
     }
 
     /// Returns the font name. If allocation is required, buf will be used,
@@ -217,6 +257,7 @@ pub const Face = struct {
 
         var f = try initFace(self.lib, self.face, opts);
         errdefer f.deinit();
+        try f.inheritFontFeatures(self);
         f.synthetic = self.synthetic;
         f.synthetic.bold = true;
 
@@ -232,10 +273,25 @@ pub const Face = struct {
 
         var f = try initFace(self.lib, self.face, opts);
         errdefer f.deinit();
+        try f.inheritFontFeatures(self);
         f.synthetic = self.synthetic;
         f.synthetic.italic = true;
 
         return f;
+    }
+
+    /// Inherit the font features of the given parent face. Synthetic faces
+    /// share the parent's font data, so they should also share any
+    /// per-face features (e.g. from fontconfig).
+    fn inheritFontFeatures(self: *Face, parent: *const Face) !void {
+        if (parent.font_features.len == 0) return;
+
+        const features = try self.lib.alloc.dupe(
+            harfbuzz.Feature,
+            parent.font_features,
+        );
+        if (self.font_features.len > 0) self.lib.alloc.free(self.font_features);
+        self.font_features = features;
     }
 
     /// Resize the font in-place. If this succeeds, the caller is responsible
@@ -321,6 +377,12 @@ pub const Face = struct {
     /// face doesn't support this glyph, null is returned.
     pub fn glyphIndex(self: Face, cp: u32) ?u32 {
         return self.face.getCharIndex(cp);
+    }
+
+    /// Returns the font features configured for this face. These are
+    /// applied during shaping before any global font features.
+    pub fn fontFeatures(self: *const Face) []const harfbuzz.Feature {
+        return self.font_features;
     }
 
     /// Returns true if this font is colored. This can be used by callers to
@@ -1437,4 +1499,40 @@ test "bitmap glyph OTB" {
             );
         }
     }
+}
+
+test "parse font features" {
+    const alloc = testing.allocator;
+
+    const features = try Face.parseFontFeatures(
+        alloc,
+        &.{ "liga off", "dlig", "cv01=2" },
+    );
+    defer alloc.free(features);
+
+    const expected = [_]feature.Feature{
+        .{ .tag = "liga".*, .value = 0 },
+        .{ .tag = "dlig".*, .value = 1 },
+        .{ .tag = "cv01".*, .value = 2 },
+    };
+    try testing.expectEqual(expected.len, features.len);
+    for (expected, features) |e, actual| {
+        try testing.expectEqual(
+            std.mem.nativeToBig(u32, @bitCast(e.tag)),
+            actual.tag,
+        );
+        try testing.expectEqual(e.value, actual.value);
+        try testing.expectEqual(
+            @as(c_uint, harfbuzz.c.HB_FEATURE_GLOBAL_START),
+            actual.start,
+        );
+        try testing.expectEqual(
+            @as(c_uint, harfbuzz.c.HB_FEATURE_GLOBAL_END),
+            actual.end,
+        );
+    }
+
+    // No configured features means we return an empty static slice.
+    const empty_features = try Face.parseFontFeatures(alloc, &.{});
+    try testing.expectEqual(@as(usize, 0), empty_features.len);
 }

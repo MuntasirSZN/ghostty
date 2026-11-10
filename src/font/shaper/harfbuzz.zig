@@ -34,6 +34,10 @@ pub const Shaper = struct {
     /// The features to use for shaping.
     hb_feats: []harfbuzz.Feature,
 
+    /// Scratch buffer used to combine the default features, per-face
+    /// features, and global configuration when a face has its own features.
+    feature_buf: std.ArrayList(harfbuzz.Feature) = .empty,
+
     /// The codepoints added to the buffer before shaping. We need to keep
     /// these separately because after shaping, HarfBuzz replaces codepoints
     /// with glyph indices in the buffer.
@@ -97,6 +101,7 @@ pub const Shaper = struct {
         self.hb_buf.destroy();
         self.cell_buf.deinit(self.alloc);
         self.alloc.free(self.hb_feats);
+        self.feature_buf.deinit(self.alloc);
         self.codepoints.deinit(self.alloc);
     }
 
@@ -139,14 +144,44 @@ pub const Shaper = struct {
             defer run.grid.lock.unlock(global.io());
 
             const face = try run.grid.resolver.collection.getFace(run.font_index);
-            const i = if (!face.quirks_disable_default_font_features) 0 else i: {
-                // If we are disabling default font features we just offset
-                // our features by the hardcoded items because always
-                // add those at the beginning.
-                break :i default_features.len;
-            };
 
-            harfbuzz.shape(face.hb_font, self.hb_buf, self.hb_feats[i..]);
+            // Per-face features (e.g. from fontconfig) are applied between
+            // the default features and the global configuration. Later
+            // features override earlier ones with the same tag, so the
+            // user's global configuration still wins.
+            const face_features: []const harfbuzz.Feature = if (comptime @hasDecl(
+                Face,
+                "fontFeatures",
+            )) face.fontFeatures() else &.{};
+
+            if (face_features.len == 0) {
+                const i = if (!face.quirks_disable_default_font_features) 0 else i: {
+                    // If we are disabling default font features we just offset
+                    // our features by the hardcoded items because always
+                    // add those at the beginning.
+                    break :i default_features.len;
+                };
+
+                harfbuzz.shape(face.hb_font, self.hb_buf, self.hb_feats[i..]);
+            } else {
+                const start: usize = if (!face.quirks_disable_default_font_features)
+                    0
+                else
+                    default_features.len;
+
+                self.feature_buf.clearRetainingCapacity();
+                try self.feature_buf.appendSlice(
+                    self.alloc,
+                    self.hb_feats[start..default_features.len],
+                );
+                try self.feature_buf.appendSlice(self.alloc, face_features);
+                try self.feature_buf.appendSlice(
+                    self.alloc,
+                    self.hb_feats[default_features.len..],
+                );
+
+                harfbuzz.shape(face.hb_font, self.hb_buf, self.feature_buf.items);
+            }
         }
 
         // If our buffer is empty, we short-circuit the rest of the work

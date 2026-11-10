@@ -714,6 +714,11 @@ pub const LoadOptions = struct {
     /// of flags see `pkg.freetype.face.LoadFlags`.
     freetype_load_flags: font.face.FreetypeLoadFlags = font.face.freetype_load_flags_default,
 
+    /// Whether `freetype_load_flags` was explicitly configured by the user.
+    /// If false and fontconfig is available, load flags are derived from
+    /// the per-font fontconfig configuration at load time.
+    freetype_load_flags_explicit: bool = false,
+
     pub fn deinit(self: *LoadOptions, alloc: Allocator) void {
         _ = self;
         _ = alloc;
@@ -724,6 +729,7 @@ pub const LoadOptions = struct {
         return .{
             .size = self.size,
             .freetype_load_flags = self.freetype_load_flags,
+            .freetype_load_flags_explicit = self.freetype_load_flags_explicit,
         };
     }
 };

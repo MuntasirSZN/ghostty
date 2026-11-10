@@ -520,6 +520,16 @@ language: ?[:0]const u8 = null,
 /// explicitly disable flags you don't want. You can also use `true` or `false`
 /// to turn all flags on or off.
 ///
+/// By default, Ghostty uses the per-font fontconfig configuration (when
+/// built with fontconfig support) to determine antialiasing and hinting
+/// behavior, matching other fontconfig-aware applications. If this
+/// configuration is set, the specified flags override the fontconfig
+/// configuration entirely.
+///
+/// The defaults listed below are used when fontconfig is unavailable, when
+/// Ghostty is not built with fontconfig support, or when a font does not
+/// specify a value.
+///
 /// This configuration only applies to Ghostty builds that use FreeType.
 /// This is usually the case only for Linux builds. macOS uses CoreText
 /// and does not have an equivalent configuration.
@@ -543,7 +553,7 @@ language: ?[:0]const u8 = null,
 ///     default.
 ///
 /// Example: `hinting`, `no-hinting`, `force-autohint`, `no-force-autohint`
-@"freetype-load-flags": FreetypeLoadFlags = .{},
+@"freetype-load-flags": ?FreetypeLoadFlags = null,
 
 /// A theme to use. This can be a built-in theme name, a custom theme
 /// name, or an absolute path to a custom theme file. Ghostty also supports
@@ -9931,8 +9941,12 @@ pub const FreetypeLoadFlags = packed struct {
     // for Freetype itself. Ghostty hasn't made any opinionated changes
     // to these defaults. (Strictly speaking, `light` isn't FreeType's
     // own default, but appears to be the effective default with most
-    // Fontconfig-aware software using FreeType, so until Ghostty
-    // implements Fontconfig support we default to `light`.)
+    // Fontconfig-aware software using FreeType.)
+    //
+    // When fontconfig is available, these defaults are replaced by the
+    // values derived from the per-font fontconfig configuration unless
+    // the user explicitly sets `freetype-load-flags` in their Ghostty
+    // configuration.
     hinting: bool = true,
     @"force-autohint": bool = false,
     monochrome: bool = false,
@@ -11254,6 +11268,44 @@ test "clipboard write limit" {
         std.math.maxInt(usize),
         cfg.@"clipboard-write-limit-bytes".value,
     );
+}
+
+test "freetype-load-flags" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // By default, the flags are unset so fontconfig can provide them.
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try testing.expectEqual(null, cfg.@"freetype-load-flags");
+    }
+
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--freetype-load-flags=hinting",
+        } };
+        try cfg.loadIter(alloc, &it);
+
+        const flags = cfg.@"freetype-load-flags".?;
+        try testing.expect(flags.hinting);
+        try testing.expect(flags.light);
+    }
+
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--freetype-load-flags=no-light",
+        } };
+        try cfg.loadIter(alloc, &it);
+
+        const flags = cfg.@"freetype-load-flags".?;
+        try testing.expect(flags.hinting);
+        try testing.expect(!flags.light);
+    }
 }
 
 test "compatibility: scrollback-limit renamed to bytes" {

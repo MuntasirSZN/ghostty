@@ -228,9 +228,24 @@ pub fn load(
 fn loadFontconfig(
     self: *DeferredFace,
     lib: Library,
-    opts: font.face.Options,
+    opts_in: font.face.Options,
 ) !Face {
     const fc = self.fc.?;
+    var opts = opts_in;
+
+    // Unless the user explicitly configured the load flags, derive them
+    // from the per-font fontconfig configuration. Fontconfig's render
+    // prepared pattern includes both the global and per-font settings.
+    if (!opts.freetype_load_flags_explicit) {
+        var flags: font.face.FreetypeLoadFlags = .{};
+        applyFontconfigSettings(fontconfigSettings(fc.pattern), &flags);
+        opts.freetype_load_flags = flags;
+    }
+
+    // Collect any font features configured for this font in fontconfig.
+    var features = try collectFontFeatures(lib.alloc, fc.pattern);
+    defer features.deinit(lib.alloc);
+    if (features.items.len > 0) opts.font_features = features.items;
 
     // Filename and index for our face so we can load it
     const filename = (try fc.pattern.get(.file, 0)).string;
@@ -240,6 +255,113 @@ fn loadFontconfig(
     errdefer face.deinit();
     try face.setVariations(fc.variations, opts);
     return face;
+}
+
+/// The fontconfig properties that influence how FreeType loads a font.
+/// Missing properties are represented as null so that we can tell them
+/// apart from explicitly configured defaults.
+const FontconfigSettings = struct {
+    antialias: ?bool = null,
+    hinting: ?bool = null,
+    hint_style: ?i32 = null,
+    autohint: ?bool = null,
+};
+
+fn fontconfigSettings(pat: *fontconfig.Pattern) FontconfigSettings {
+    return .{
+        .antialias = patternBool(pat, .antialias),
+        .hinting = patternBool(pat, .hinting),
+        .hint_style = patternInteger(pat, .hint_style),
+        .autohint = patternBool(pat, .autohint),
+    };
+}
+
+/// Apply the fontconfig settings to the given load flags.
+///
+/// Fontconfig and FreeType don't have a one-to-one mapping for these
+/// settings, so we follow the same choices as other fontconfig-aware
+/// applications (e.g. Pango):
+///
+///   * `antialias=false` maps to monochrome rendering.
+///   * `hinting=false` and `hintstyle=none` disable hinting.
+///   * `hintstyle=slight` and `hintstyle=medium` use light hinting and
+///     `hintstyle=full` uses normal hinting.
+///   * `autohint=true` forces the auto-hinter. `autohint=false` is left
+///     alone because it only means "prefer the native hinter", not
+///     "disable the auto-hinter".
+fn applyFontconfigSettings(
+    settings: FontconfigSettings,
+    flags: anytype,
+) void {
+    if (settings.antialias) |antialias| {
+        flags.monochrome = !antialias;
+    }
+
+    if (settings.hinting) |hinting| {
+        flags.hinting = hinting;
+    }
+
+    // Fontconfig hint styles: none=0, slight=1, medium=2, full=3.
+    if (settings.hint_style) |hint_style| {
+        switch (hint_style) {
+            0 => flags.hinting = false,
+            1, 2 => flags.light = true,
+            3 => flags.light = false,
+            else => {},
+        }
+    }
+
+    if (settings.autohint) |autohint| {
+        if (autohint) flags.@"force-autohint" = true;
+    }
+}
+
+fn patternBool(
+    pat: *fontconfig.Pattern,
+    prop: fontconfig.Property,
+) ?bool {
+    const value = pat.get(prop, 0) catch return null;
+    return switch (value) {
+        .bool => |v| v,
+        .integer => |v| v != 0,
+        else => null,
+    };
+}
+
+fn patternInteger(
+    pat: *fontconfig.Pattern,
+    prop: fontconfig.Property,
+) ?i32 {
+    const value = pat.get(prop, 0) catch return null;
+    return switch (value) {
+        .integer => |v| v,
+        .bool => |v| @intFromBool(v),
+        else => null,
+    };
+}
+
+/// Collect the font features configured for a font in fontconfig. The
+/// returned strings are owned by the pattern; the caller owns the list.
+fn collectFontFeatures(
+    alloc: Allocator,
+    pat: *fontconfig.Pattern,
+) !std.ArrayList([]const u8) {
+    var features: std.ArrayList([]const u8) = .empty;
+    errdefer features.deinit(alloc);
+
+    var id: u32 = 0;
+    while (true) : (id += 1) {
+        const value = pat.get(.font_features, id) catch |err| switch (err) {
+            error.FontconfigNoMatch, error.FontconfigNoId => break,
+            else => return err,
+        };
+        switch (value) {
+            .string => |s| try features.append(alloc, s),
+            else => {},
+        }
+    }
+
+    return features;
 }
 
 fn loadWindows(
@@ -505,6 +627,108 @@ test "fontconfig" {
     var face = try def.load(lib, .{ .size = .{ .points = 12 } });
     defer face.deinit();
     try testing.expect(face.glyphIndex(' ') != null);
+}
+
+test "fontconfig load flags" {
+    if (options.backend != .fontconfig_freetype) return error.SkipZigTest;
+
+    const testing = std.testing;
+
+    // Mirror the fields of FreetypeLoadFlags so we can test the mapping
+    // without depending on the FreeType backend being enabled.
+    const TestFlags = struct {
+        hinting: bool = true,
+        @"force-autohint": bool = false,
+        monochrome: bool = false,
+        autohint: bool = true,
+        light: bool = true,
+    };
+    const flagsFrom = struct {
+        fn init(pat: *fontconfig.Pattern) TestFlags {
+            var flags: TestFlags = .{};
+            applyFontconfigSettings(fontconfigSettings(pat), &flags);
+            return flags;
+        }
+    }.init;
+
+    // With no properties set we keep Ghostty's defaults.
+    {
+        var pat = fontconfig.Pattern.create();
+        defer pat.destroy();
+
+        const flags = flagsFrom(pat);
+        try testing.expect(flags.hinting);
+        try testing.expect(!flags.monochrome);
+        try testing.expect(flags.light);
+        try testing.expect(!flags.@"force-autohint");
+    }
+
+    // antialias=false, hinting=false, hintstyle=full, autohint=true.
+    {
+        var pat = fontconfig.Pattern.create();
+        defer pat.destroy();
+        try testing.expect(pat.add(.antialias, .{ .bool = false }, false));
+        try testing.expect(pat.add(.hinting, .{ .bool = false }, false));
+        try testing.expect(pat.add(.hint_style, .{ .integer = 3 }, false));
+        try testing.expect(pat.add(.autohint, .{ .bool = true }, false));
+
+        const flags = flagsFrom(pat);
+        try testing.expect(flags.monochrome);
+        try testing.expect(!flags.hinting);
+        try testing.expect(!flags.light);
+        try testing.expect(flags.@"force-autohint");
+    }
+
+    // hintstyle=slight and hintstyle=medium both use light hinting.
+    for ([_]i32{ 1, 2 }) |hint_style| {
+        var pat = fontconfig.Pattern.create();
+        defer pat.destroy();
+        try testing.expect(pat.add(.hinting, .{ .bool = true }, false));
+        try testing.expect(pat.add(.hint_style, .{ .integer = hint_style }, false));
+
+        const flags = flagsFrom(pat);
+        try testing.expect(flags.hinting);
+        try testing.expect(flags.light);
+    }
+
+    // hintstyle=none disables hinting.
+    {
+        var pat = fontconfig.Pattern.create();
+        defer pat.destroy();
+        try testing.expect(pat.add(.hinting, .{ .bool = true }, false));
+        try testing.expect(pat.add(.hint_style, .{ .integer = 0 }, false));
+
+        const flags = flagsFrom(pat);
+        try testing.expect(!flags.hinting);
+    }
+
+    // autohint=false only means "prefer the native hinter", so it must not
+    // turn off an explicitly forced auto-hinter.
+    {
+        var pat = fontconfig.Pattern.create();
+        defer pat.destroy();
+        try testing.expect(pat.add(.autohint, .{ .bool = false }, false));
+
+        var flags: TestFlags = .{ .@"force-autohint" = true };
+        applyFontconfigSettings(fontconfigSettings(pat), &flags);
+        try testing.expect(flags.@"force-autohint");
+    }
+}
+
+test "fontconfig font features" {
+    const testing = std.testing;
+
+    var pat = fontconfig.Pattern.create();
+    defer pat.destroy();
+    try testing.expect(pat.add(.font_features, .{ .string = "dlig" }, true));
+    try testing.expect(pat.add(.font_features, .{ .string = "cv01=2" }, true));
+
+    var features = try collectFontFeatures(testing.allocator, pat);
+    defer features.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 2), features.items.len);
+    try testing.expectEqualStrings("dlig", features.items[0]);
+    try testing.expectEqualStrings("cv01=2", features.items[1]);
 }
 
 test "coretext" {

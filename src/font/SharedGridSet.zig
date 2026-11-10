@@ -169,6 +169,7 @@ fn collection(
         .library = self.font_lib,
         .size = size,
         .freetype_load_flags = key.freetype_load_flags,
+        .freetype_load_flags_explicit = key.freetype_load_flags_explicit,
     };
 
     var c = Collection.init();
@@ -503,7 +504,10 @@ pub const DerivedConfig = struct {
     @"adjust-cursor-height": ?Metrics.Modifier,
     @"adjust-box-thickness": ?Metrics.Modifier,
     @"adjust-icon-height": ?Metrics.Modifier,
-    @"freetype-load-flags": font.face.FreetypeLoadFlags,
+    @"freetype-load-flags": if (font.face.FreetypeLoadFlags != void)
+        ?font.face.FreetypeLoadFlags
+    else
+        void,
 
     /// Initialize a DerivedConfig. The config should be either a
     /// config.Config or another DerivedConfig to clone from.
@@ -586,6 +590,11 @@ pub const Key = struct {
     /// The freetype load flags configuration, only non-void if the
     /// freetype backend is enabled.
     freetype_load_flags: font.face.FreetypeLoadFlags = font.face.freetype_load_flags_default,
+
+    /// Whether the freetype load flags were explicitly configured by the
+    /// user. If false and fontconfig is available, each face derives its
+    /// load flags from the per-font fontconfig configuration.
+    freetype_load_flags_explicit: bool = false,
 
     const style_offsets_len = std.enums.directEnumArrayLen(Style, 0);
     const StyleOffsets = [style_offsets_len]usize;
@@ -711,9 +720,13 @@ pub const Key = struct {
             .metric_modifiers = metric_modifiers,
             .font_size = font_size,
             .freetype_load_flags = if (font.face.FreetypeLoadFlags != void)
-                config.@"freetype-load-flags"
+                config.@"freetype-load-flags" orelse font.face.freetype_load_flags_default
             else
                 font.face.freetype_load_flags_default,
+            .freetype_load_flags_explicit = if (font.face.FreetypeLoadFlags != void)
+                config.@"freetype-load-flags" != null
+            else
+                false,
         };
     }
 
@@ -744,6 +757,7 @@ pub const Key = struct {
         self.codepoint_map.hash(hasher);
         autoHash(hasher, self.metric_modifiers.count());
         autoHash(hasher, self.freetype_load_flags);
+        autoHash(hasher, self.freetype_load_flags_explicit);
         if (self.metric_modifiers.count() > 0) {
             inline for (@typeInfo(Metrics.Key).@"enum".field_names) |field| {
                 const key = @field(Metrics.Key, field);

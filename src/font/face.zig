@@ -39,7 +39,19 @@ pub const freetype_load_flags_default: FreetypeLoadFlags = if (FreetypeLoadFlags
 /// Options for initializing a font face.
 pub const Options = struct {
     size: DesiredSize,
+
+    /// Freetype load flags to use for this face.
     freetype_load_flags: FreetypeLoadFlags = freetype_load_flags_default,
+
+    /// Whether the freetype load flags were explicitly configured by the
+    /// user. If false and fontconfig is available, the load flags are
+    /// derived from the per-font fontconfig configuration instead.
+    freetype_load_flags_explicit: bool = false,
+
+    /// Font features to enable for this face, in the same format as the
+    /// `font-feature` configuration. These are applied before (and can be
+    /// overridden by) the global font features.
+    font_features: []const []const u8 = &.{},
 };
 
 /// The desired size for loading a font.
